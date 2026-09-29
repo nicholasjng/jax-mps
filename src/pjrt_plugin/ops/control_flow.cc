@@ -11,6 +11,7 @@
 #include <mlx/transforms.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -1413,6 +1414,144 @@ inline uint32_t tfry_rotl(uint32_t x, uint32_t n) {
     return outs;
 }
 
+// Palladium sends its kernel as three pieces of text: a header (includes,
+// using directives, helper functions), a prologue binding the emitter's
+// parameter names to MLX's generated signature (buffers arrive as
+// `arg<N>_base`; Metal builtins under their attribute names), and the body.
+// This handler concatenates them and never parses MSL. A descriptor version
+// bump is required if that contract ever changes.
+constexpr int64_t kPalladiumDescriptorVersion = 2;
+
+// MLX declares inputs smaller than this many elements in the `constant`
+// address space, which Palladium's `device` pointer casts cannot accept.
+// Padding such inputs to the threshold keeps every buffer `device`; the
+// kernel only reads the elements it addressed anyway.
+constexpr int kMlxConstantArrayThreshold = 8;
+
+mlx::core::array PalladiumDeviceInput(const mlx::core::array& input) {
+    if (input.size() >= kMlxConstantArrayThreshold)
+        return input;
+    auto flat = mlx::core::reshape(input, {static_cast<int32_t>(input.size())});
+    return mlx::core::pad(flat, {0}, {0},
+                          {static_cast<int>(kMlxConstantArrayThreshold - input.size())},
+                          mlx::core::array(0, input.dtype()));
+}
+
+std::optional<std::array<int, 3>> PalladiumGrid(const llvm::json::Object& config,
+                                                llvm::StringRef name) {
+    auto* values = config.getArray(name);
+    if (!values || values->size() != 3)
+        return std::nullopt;
+    std::array<int, 3> result;
+    for (size_t i = 0; i < result.size(); ++i) {
+        const auto& value = (*values)[i];
+        auto integer = value.getAsInteger();
+        if (!integer || *integer < 1 || *integer > std::numeric_limits<int>::max())
+            return std::nullopt;
+        result[i] = static_cast<int>(*integer);
+    }
+    return result;
+}
+
+// Handle Palladium's explicit Pallas-kernel custom call. The source is traced
+// and emitted by Palladium; this handler only constructs an MLX graph node, so
+// inputs and outputs remain owned by MLX and share its command stream with the
+// surrounding JAX program.
+bool HandlePalladiumDispatch(mlir::Operation* op, ValueMap& values,
+                             mlir::stablehlo::CustomCallOp customCallOp) {
+    constexpr int64_t kPalladiumFastMathMode = 2;
+    auto config = ParseBackendConfig(customCallOp);
+    auto version = config.getInteger("version");
+    auto math_mode = config.getInteger("math_mode");
+    auto header = config.getString("header");
+    auto prologue = config.getString("prologue");
+    auto body = config.getString("body");
+    if (!version || *version != kPalladiumDescriptorVersion || !math_mode ||
+        *math_mode != kPalladiumFastMathMode || !header || !prologue || !body) {
+        MPS_LOG_ERROR("palladium.dispatch: invalid descriptor or unsupported math mode\n");
+        return false;
+    }
+    auto grid = PalladiumGrid(config, "grid");
+    if (!grid) {
+        MPS_LOG_ERROR("palladium.dispatch: grid must be three positive integers\n");
+        return false;
+    }
+    const auto header_string = header->str();
+    auto source_body = prologue->str();
+    source_body += "\n";
+    source_body += body->str();
+
+    std::array<int, 3> threadgroup;
+    if (config.get("threadgroup")) {
+        auto parsed = PalladiumGrid(config, "threadgroup");
+        if (!parsed) {
+            MPS_LOG_ERROR("palladium.dispatch: threadgroup must be three positive integers\n");
+            return false;
+        }
+        threadgroup = *parsed;
+    } else {
+        // Ordinary Palladium programs are independent Metal threads. This is
+        // the same conservative launch shape metal-runtime chooses for a 1-D
+        // grid; cooperative kernels carry an explicit threadgroup above.
+        threadgroup = {std::min((*grid)[0], 256), 1, 1};
+    }
+
+    std::vector<mlx::core::array> inputs;
+    std::vector<std::string> input_names;
+    inputs.reserve(op->getNumOperands());
+    input_names.reserve(op->getNumOperands());
+    for (unsigned i = 0; i < op->getNumOperands(); ++i) {
+        auto name = "arg" + std::to_string(i) + "_base";
+        auto* input = RequireValue(values, op->getOperand(i), "palladium.dispatch");
+        if (!input)
+            return false;
+        input_names.push_back(std::move(name));
+        inputs.push_back(PalladiumDeviceInput(*input));
+    }
+
+    std::vector<std::string> output_names;
+    std::vector<mlx::core::Shape> output_shapes;
+    std::vector<mlx::core::Dtype> output_dtypes;
+    output_names.reserve(op->getNumResults());
+    output_shapes.reserve(op->getNumResults());
+    output_dtypes.reserve(op->getNumResults());
+    for (unsigned i = 0; i < op->getNumResults(); ++i) {
+        auto type = mlir::dyn_cast<mlir::RankedTensorType>(op->getResult(i).getType());
+        if (!type) {
+            MPS_LOG_ERROR("palladium.dispatch: result %u is not a ranked tensor\n", i);
+            return false;
+        }
+        output_names.push_back("arg" + std::to_string(op->getNumOperands() + i) + "_base");
+        output_shapes.push_back(GetShape(type));
+        output_dtypes.push_back(MlirTypeToMlxDtype(type.getElementType()));
+    }
+
+    // MLX caches the compiled library behind this name. Include the full MSL
+    // in the hash: Palladium specializes source by shape and must never reuse
+    // a pipeline compiled from a different specialization.
+    const auto kernel_name =
+        "palladium_" + std::to_string(std::hash<std::string>{}(header_string + source_body));
+    auto compile_options = mlx::core::CompileOptions{};
+    compile_options.math_mode = mlx::core::MathMode::Fast;
+    auto kernel = mlx::core::fast::metal_kernel(kernel_name, input_names, output_names,
+                                                source_body, header_string,
+                                                /*ensure_row_contiguous=*/true,
+                                                /*atomic_outputs=*/false, compile_options);
+    auto results = kernel(inputs, output_shapes, output_dtypes,
+                          std::make_tuple((*grid)[0], (*grid)[1], (*grid)[2]),
+                          std::make_tuple(threadgroup[0], threadgroup[1], threadgroup[2]),
+                          /*template_args=*/{}, /*init_value=*/std::nullopt,
+                          /*verbose=*/false, /*s=*/{});
+    if (results.size() != op->getNumResults()) {
+        MPS_LOG_ERROR("palladium.dispatch: MLX returned %zu outputs, expected %u\n", results.size(),
+                      op->getNumResults());
+        return false;
+    }
+    for (unsigned i = 0; i < op->getNumResults(); ++i)
+        values.emplace(ToKey(op->getResult(i)), std::move(results[i]));
+    return true;
+}
+
 // Handler for stablehlo.custom_call
 bool HandleCustomCall(mlir::Operation* op, ValueMap& values, std::vector<mlx::core::array>& outputs,
                       ExecContext& ctx) {
@@ -1421,6 +1560,9 @@ bool HandleCustomCall(mlir::Operation* op, ValueMap& values, std::vector<mlx::co
         return false;
 
     auto callTargetName = customCallOp.getCallTargetName().str();
+
+    if (callTargetName == "palladium.dispatch")
+        return HandlePalladiumDispatch(op, values, customCallOp);
 
     // Handle Sharding annotation and SPMD shape ops - just pass input through
     if (callTargetName == "Sharding" || callTargetName == "SPMDFullToShardShape" ||
